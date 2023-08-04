@@ -9,7 +9,7 @@ ENCODER_VECTOR_SIZE = 4**2
 SEQ_LENGTH = 100 # how many words in the input
 
 class TransStyleGenerator(nn.Module):
-    def __init__(self, dictionary: dict, image_size: int = 64, ngf: int = 32) -> None:
+    def __init__(self, dictionary: dict, ngf: int = 32, image_size: int = 64) -> None:
         super(TransStyleGenerator, self).__init__()
 
         self.ngf = ngf
@@ -22,7 +22,7 @@ class TransStyleGenerator(nn.Module):
 
         # input
         self.main = nn.Sequential(
-            nn.ConvTranspose2d(SEQ_LENGTH, self.ngf * 2**mult, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(SEQ_LENGTH*2, self.ngf * 2**mult, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(self.ngf* 2**mult),
             nn.ReLU(inplace=True)
         )
@@ -46,7 +46,7 @@ class TransStyleGenerator(nn.Module):
         ))
 
 
-    def forward(self, text: list[str]):
+    def forward(self, text: list[str], device):
         """Process input(s) through the network module
 
         Args:
@@ -58,19 +58,25 @@ class TransStyleGenerator(nn.Module):
         B = len(text)
         # x is a list of `SEQ_LENGTH` word/tokens
 
-        x = texts_to_tensor(text, self.dictionary, SEQ_LENGTH)
+        x = texts_to_tensor(text, self.dictionary, SEQ_LENGTH).to(device)
 
         # TODO: Use checkpoints
 
         # TODO: Add sin/cos positional embedding
 
         x_embed = self.embed(x)
-        x_encode = self.encoder(x_embed) # style input
+        x_encode = self.encoder(x_embed)
+        # B * SEQ_LENGTH * ENCODER_VECTOR_SIZE
+        #print(x_encode.shape)
 
-        x_encode = x_encode.reshape(B,SEQ_LENGTH,4,4)
+        z = torch.randn(B,SEQ_LENGTH,ENCODER_VECTOR_SIZE,device=device) # add some noise
+        #print(z.shape)
 
-        x_encode += torch.randn(B,SEQ_LENGTH,4,4) # add some noise
+        x_encode = torch.cat((x_encode, z), dim=1) # concat encoded text with noise
+        #print(x_encode.shape)
 
+        x_encode = x_encode.reshape(B,SEQ_LENGTH*2,4,4)
+        
         x_out = self.main(x_encode)
         
         return x_out
