@@ -13,7 +13,7 @@ import time
 import random
 import torchvision.utils as tvutils
 
-IMG_SIZE = 64
+IMG_SIZE = 128
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -22,8 +22,10 @@ beta1disc = 0.5 # Beta1 hyperparam for Adam optimizers
 beta1gen = 0.5
 seed = time.time()
 
-ngf = 32
-ndf = 32
+ngf = 64
+ndf = 64
+
+lr = 0.0002
 
 current_epoch = 0
 
@@ -37,7 +39,7 @@ transform = transforms.Compose([
     ])
 
 raw_data = datasets.CocoCaptions(root="data/train2017/", annFile="data/captions_train2017.json", transform=transform)
-dataloader = torch.utils.data.DataLoader(raw_data, batch_size=32, shuffle=True, drop_last=True, num_workers=12,
+dataloader = torch.utils.data.DataLoader(raw_data, batch_size=64, shuffle=True, drop_last=True, num_workers=12,
                                           prefetch_factor=4, collate_fn=lambda batch: tuple(zip(*batch)))
 
 print(len(raw_data))
@@ -80,13 +82,16 @@ disc_net = Discriminator(dictionary, ndf, IMG_SIZE)
 gen_net.to(device)
 disc_net.to(device)
 
-optimizer_gen = optim.Adam(gen_net.parameters(), lr=1e-6, betas=(beta1gen, 0.999))
-optimizer_disc = optim.Adam(disc_net.parameters(), lr=1e-6, betas=(beta1disc, 0.999))
+optimizer_gen = optim.Adam(gen_net.parameters(), lr=lr, betas=(beta1gen, 0.999))
+optimizer_disc = optim.Adam(disc_net.parameters(), lr=lr, betas=(beta1disc, 0.999))
 
 criterion = nn.BCELoss().to(device)
 
 print(f"embedding parameters: {count_parameters(gen_net.embed):,}")
 print(f"generator parameters: {count_parameters(gen_net):,}")
+print(f"discriminator parameters: {count_parameters(disc_net):,}")
+
+print(f"conv {count_parameters(disc_net.embed_conv):,}")
 
 # test dictionary/tensorizor
 # print(text_to_tensor("green alien eating cake", dictionary, 100))
@@ -152,6 +157,8 @@ if loaded_checkpoint:
 
 # -= TRAIN =-
 
+z_const = torch.randn(4, gen_net.seq_length, gen_net.vec_size, device=device)
+
 def train_epoch(epoch: int):
     real_label = 1.0
     fake_label = 0.0
@@ -177,8 +184,9 @@ def train_epoch(epoch: int):
         d_loss_real = criterion(output, label)
         d_loss_real.backward()
 
+        z = torch.randn(len(output), gen_net.seq_length, gen_net.vec_size, device=device)
         # Train with batch of fake images
-        fake = gen_net(captions, device)
+        fake = gen_net(captions, z)
         label.fill_(fake_label)
         output = disc_net(fake.detach(), captions).view(-1)
         d_loss_fake = criterion(output, label)
@@ -193,15 +201,15 @@ def train_epoch(epoch: int):
 
         optimizer_gen.step()
 
-        if batch % 50 == 0:
+        if batch % 100 == 0:
             tqRange.set_postfix_str(f"d_l_real={d_loss_real:.2}, d_l_fake={d_loss_fake:.2}, g_loss={g_loss:.2}")
             tvutils.save_image(denorm(fake), "imgs.jpg")
             tvutils.save_image(denorm(images), "real.jpg")
 
         
 
-for i in range(current_epoch, current_epoch+10):
+for i in range(current_epoch, current_epoch+1000):
     train_epoch(i)
     save_checkpoint(i)
-    tvutils.save_image(denorm(gen_net(["alien eating cake"]*4,device)), f"checkpoints/alien{i}.jpg", nrow=2)
+    tvutils.save_image(denorm(gen_net(["alien eating cake"]*4, z_const)), f"checkpoints/alien{i}.jpg", nrow=2)
 

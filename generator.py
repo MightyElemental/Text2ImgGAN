@@ -2,11 +2,12 @@ import torch.nn as nn
 import torch
 from util.util import texts_to_tensor
 import math
+from positionalencoder import PositionalEncoding
 
 ENCODER_LAYERS = 6
 ENCODER_HEADS = 8
 ENCODER_VECTOR_SIZE = 4**2
-SEQ_LENGTH = 100 # how many words in the input
+SEQ_LENGTH = 48 # how many words in the input
 
 class TransStyleGenerator(nn.Module):
     def __init__(self, dictionary: dict, ngf: int = 32, image_size: int = 64) -> None:
@@ -17,8 +18,13 @@ class TransStyleGenerator(nn.Module):
 
         self.dictionary = dictionary
 
+        self.seq_length = SEQ_LENGTH
+        self.vec_size = ENCODER_VECTOR_SIZE
+
         self.embed = nn.Embedding(len(dictionary), ENCODER_VECTOR_SIZE, padding_idx=dictionary["<PAD>"])
         self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(ENCODER_VECTOR_SIZE, ENCODER_HEADS), ENCODER_LAYERS)
+
+        self.pos_encoder = PositionalEncoding(ENCODER_VECTOR_SIZE)
 
         # input
         self.main = nn.Sequential(
@@ -46,30 +52,28 @@ class TransStyleGenerator(nn.Module):
         ))
 
 
-    def forward(self, text: list[str], device):
+    def forward(self, text: list[str], z: torch.Tensor):
         """Process input(s) through the network module
 
         Args:
             x (list[str]): A list of string used as input to the network
-
-        Returns:
-            _type_: _description_
         """
         B = len(text)
         # x is a list of `SEQ_LENGTH` word/tokens
 
-        x = texts_to_tensor(text, self.dictionary, SEQ_LENGTH).to(device)
+        x = texts_to_tensor(text, self.dictionary, SEQ_LENGTH).to(z.device)
 
         # TODO: Use checkpoints
 
         # TODO: Add sin/cos positional embedding
 
         x_embed = self.embed(x)
-        x_encode = self.encoder(x_embed)
+        x_encode = self.pos_encoder(x_embed)
+        x_encode = self.encoder(x_encode)
         # B * SEQ_LENGTH * ENCODER_VECTOR_SIZE
         #print(x_encode.shape)
 
-        z = torch.randn(B,SEQ_LENGTH,ENCODER_VECTOR_SIZE,device=device) # add some noise
+        #z = torch.randn(B,SEQ_LENGTH, ENCODER_VECTOR_SIZE, device=z.device) # add some noise
         #print(z.shape)
 
         x_encode = torch.cat((x_encode, z), dim=1) # concat encoded text with noise
