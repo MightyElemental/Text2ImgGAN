@@ -162,3 +162,5 @@ cython_debug/
 # Project Specific
 /dictionary.pkl
 data/
+checkpoints/
+test.ipynb
