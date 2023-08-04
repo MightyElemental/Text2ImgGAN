@@ -4,8 +4,8 @@ import torchvision.transforms as transforms
 import os
 
 def tokenize(text: str):
-    tokens = re.findall(r"([a-z']+|[.,&\-!\"$%\^£:@;#~\<\>\\\*\(\)\=\_\+\{\}\[\]\/]|\s+)", text.lower())
-    tokens = [" " if t.isspace() else t for t in tokens] # replace all whitespace block with single-space
+    tokens = re.findall(r"([a-z']+|[.,&\-!\"$%\^£:@;#~\<\>\\\*\(\)\=\_\+\{\}\[\]\/0-9])", text.lower())
+    # tokens = [" " if t.isspace() else t for t in tokens] # replace all whitespace block with single-space
     return tokens
 
 def pad_tokens(tokens: list[str], max_len: int):
