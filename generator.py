@@ -4,7 +4,7 @@ from util.util import texts_to_tensor
 import math
 from positionalencoder import PositionalEncoding
 
-ENCODER_LAYERS = 6
+ENCODER_LAYERS = 8
 ENCODER_HEADS = 8
 ENCODER_VECTOR_SIZE = 4**2
 SEQ_LENGTH = 48 # how many words in the input

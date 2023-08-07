@@ -4,7 +4,7 @@ from minibatchdiscriminator import MinibatchDiscriminator
 from util.util import texts_to_tensor
 from positionalencoder import PositionalEncoding
 
-ENCODER_LAYERS = 6
+ENCODER_LAYERS = 8
 ENCODER_HEADS = 8
 ENCODER_VECTOR_SIZE = 4**2
 SEQ_LENGTH = 48 # how many words in the input
@@ -19,15 +19,15 @@ class Discriminator(nn.Module):
 
         self.encode_mult = self.image_size//4
 
-        self.embed_conv = nn.Sequential(
-            nn.ConvTranspose2d(48,24,4,1,2),
-            nn.ReLU(),
-            nn.ConvTranspose2d(24,12,4,2,0),
-            nn.ReLU(),
-            nn.ConvTranspose2d(12,6,4,2,1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(6,3,4,2,1),
-        ) # generates shape B*3*128*128 from input B*48*4*4
+        #self.embed_conv = nn.Sequential(
+        #    nn.ConvTranspose2d(48,24,4,1,2),
+        #    nn.ReLU(),
+        #    nn.ConvTranspose2d(24,12,4,2,0),
+        #    nn.ReLU(),
+        #    nn.ConvTranspose2d(12,6,4,2,1),
+        #    nn.ReLU(),
+        #    nn.ConvTranspose2d(6,3,4,2,1),
+        #) # generates shape B*3*128*128 from input B*48*4*4
 
         self.embed = nn.Embedding(len(dictionary), ENCODER_VECTOR_SIZE, padding_idx=dictionary["<PAD>"])
         self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(ENCODER_VECTOR_SIZE, ENCODER_HEADS), ENCODER_LAYERS)
@@ -35,7 +35,7 @@ class Discriminator(nn.Module):
 
         # input
         self.main = nn.Sequential(
-            nn.Conv2d(in_channels=3+3, out_channels=ndf, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Conv2d(in_channels=3+SEQ_LENGTH, out_channels=ndf, kernel_size=4, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(ndf),
             nn.LeakyReLU(0.3, inplace=True),
         )
@@ -77,10 +77,10 @@ class Discriminator(nn.Module):
         caps = self.embed(caps)
         caps = self.pos_encoder(caps)
         caps = self.encoder(caps)
-        #caps = caps.reshape(-1, SEQ_LENGTH, 4, 4)
-        caps = caps.view(-1,SEQ_LENGTH,16,1).expand(-1,SEQ_LENGTH,16,16)
-        #caps = caps.repeat(1,1,self.encode_mult,self.encode_mult)
-        caps = self.embed_conv(caps)
+        caps = caps.reshape(-1, SEQ_LENGTH, 4, 4)
+        #caps = caps.view(-1,SEQ_LENGTH,16,1).expand(-1,SEQ_LENGTH,16,16)
+        caps = caps.repeat(1,1,self.encode_mult,self.encode_mult)
+        #caps = self.embed_conv(caps)
 
         x = torch.cat((x, caps), dim=1)
 

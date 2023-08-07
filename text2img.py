@@ -23,9 +23,9 @@ beta1gen = 0.5
 seed = time.time()
 
 ngf = 64
-ndf = 64
+ndf = 28
 
-lr = 0.0002
+lr = 2e-6
 
 current_epoch = 0
 
@@ -90,8 +90,6 @@ criterion = nn.BCELoss().to(device)
 print(f"embedding parameters: {count_parameters(gen_net.embed):,}")
 print(f"generator parameters: {count_parameters(gen_net):,}")
 print(f"discriminator parameters: {count_parameters(disc_net):,}")
-
-print(f"conv {count_parameters(disc_net.embed_conv):,}")
 
 # test dictionary/tensorizor
 # print(text_to_tensor("green alien eating cake", dictionary, 100))
@@ -211,5 +209,5 @@ def train_epoch(epoch: int):
 for i in range(current_epoch, current_epoch+1000):
     train_epoch(i)
     save_checkpoint(i)
-    tvutils.save_image(denorm(gen_net(["alien eating cake"]*4, z_const)), f"checkpoints/alien{i}.jpg", nrow=2)
+    tvutils.save_image(denorm(gen_net(["alien", "A black Honda motorcycle parked in front of a garage"]*2, z_const)), f"checkpoints/alien{i}.jpg", nrow=2)
 
