@@ -11,7 +11,7 @@ dependencies:
     - pytorch=2.0.0
     - numpy>=1.22.4
     - torchvision
-    - torchaudio
+    - torchtext
     - pytorch-cuda=11.8
     - pip
     - matplotlib
