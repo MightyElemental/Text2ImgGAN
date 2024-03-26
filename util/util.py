@@ -2,14 +2,15 @@ import re
 import torch
 import torchvision.transforms as transforms
 import os
+import torchtext as tt
+
+tokenizer = tt.data.get_tokenizer("basic_english")
 
 def tokenize(text: str):
-    tokens = re.findall(r"([a-z']+|[.,&\-!\"$%\^£:@;#~\<\>\\\*\(\)\=\_\+\{\}\[\]\/0-9])", text.lower())
-    # tokens = [" " if t.isspace() else t for t in tokens] # replace all whitespace block with single-space
-    return tokens
+    return tokenizer(text)
 
 def pad_tokens(tokens: list[str], max_len: int):
-    padded = tokens[:max_len] + ["<PAD>"]*(max_len-len(tokens))
+    padded = tokens[:max_len] + [""]*(max_len-len(tokens))
     return padded
 
 def text_to_tensor(text: str, dictionary: dict, max_len: int):
