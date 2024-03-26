@@ -4,17 +4,17 @@ from minibatchdiscriminator import MinibatchDiscriminator
 from util.util import texts_to_tensor
 from positionalencoder import PositionalEncoding
 
-ENCODER_LAYERS = 8
-ENCODER_HEADS = 8
-ENCODER_VECTOR_SIZE = 4**2
-SEQ_LENGTH = 48 # how many words in the input
+ENCODER_LAYERS = 6
+ENCODER_HEADS = 10
 
 class Discriminator(nn.Module):
-    def __init__(self, dictionary: dict, ndf: int, image_size: int = 64):
+    def __init__(self, ndf: int, image_size: int = 64, seq_len: int = 32, enc_vec_size: int = 300):
         super(Discriminator, self).__init__()
         self.ndf = ndf
 
-        self.dictionary = dictionary
+        self.seq_length = seq_len
+        self.vec_size = enc_vec_size
+
         self.image_size = image_size
 
         self.encode_mult = self.image_size//4
@@ -29,13 +29,12 @@ class Discriminator(nn.Module):
         #    nn.ConvTranspose2d(6,3,4,2,1),
         #) # generates shape B*3*128*128 from input B*48*4*4
 
-        self.embed = nn.Embedding(len(dictionary), ENCODER_VECTOR_SIZE, padding_idx=dictionary["<PAD>"])
-        self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(ENCODER_VECTOR_SIZE, ENCODER_HEADS), ENCODER_LAYERS)
-        self.pos_encoder = PositionalEncoding(ENCODER_VECTOR_SIZE)
+        self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(self.vec_size, ENCODER_HEADS), ENCODER_LAYERS)
+        self.pos_encoder = PositionalEncoding(self.vec_size)
 
         # input
         self.main = nn.Sequential(
-            nn.Conv2d(in_channels=3+SEQ_LENGTH, out_channels=ndf, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Conv2d(in_channels=3+self.seq_length, out_channels=ndf, kernel_size=4, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(ndf),
             nn.LeakyReLU(0.3, inplace=True),
         )
@@ -72,12 +71,9 @@ class Discriminator(nn.Module):
 
 
     def forward(self, x, captions):
-
-        caps = texts_to_tensor(captions, self.dictionary, SEQ_LENGTH).to(x.device)
-        caps = self.embed(caps)
-        caps = self.pos_encoder(caps)
+        caps = self.pos_encoder(captions)
         caps = self.encoder(caps)
-        caps = caps.reshape(-1, SEQ_LENGTH, 4, 4)
+        caps = caps.reshape(-1, self.seq_length, 4, 4)
         #caps = caps.view(-1,SEQ_LENGTH,16,1).expand(-1,SEQ_LENGTH,16,16)
         caps = caps.repeat(1,1,self.encode_mult,self.encode_mult)
         #caps = self.embed_conv(caps)
