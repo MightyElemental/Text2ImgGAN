@@ -164,3 +164,7 @@ cython_debug/
 data/
 checkpoints/
 test.ipynb
+saved_examples/
+*.png
+*.jpg
+.vector_cache/
