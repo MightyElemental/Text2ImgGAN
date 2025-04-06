@@ -1,339 +1,322 @@
 #!/usr/bin/env python3
 
-#import util.webhook as webhook
-from stylegan import StyleGenerator, Discriminator, NLPLatentEncoder
-from tqdm import tqdm # progress bar
-from torchvision import datasets
-import torchvision.transforms as transforms
-import torch.nn as nn
-import torch
-from util.util import *
+"""
+text2img.py
+
+This script trains a text-to-image model that generates 256x256 images from input text.
+It loads the COCO Captions dataset with transforms v2 (Resize, RandomHorizontalFlip,
+CenterCrop, and Normalize), tokenizes the captions, and converts them into embeddings
+using pre-trained GloVe. Captions are padded/truncated to 64 tokens; a corresponding mask
+is generated to ignore padded tokens in the transformer encoder.
+
+The generator network uses a transformer encoder to process text and produce a latent vector.
+That latent vector is passed to a DCGAN generator that outputs a 256x256 image.
+A DCGAN discriminator is trained adversarially against the generator.
+Model checkpoints are saved after each epoch, and training statistics are logged to TensorBoard.
+Additionally, every 500 batches eight generated images (using eight fixed text prompts)
+are sent to TensorBoard.
+
+Usage:
+    python text2img.py --epochs 10 --batch_size 32 --learning_rate 0.0002
+"""
+
 import os
+import argparse
+from datetime import datetime
+import torch
 import torch.optim as optim
-import time
-import random
-#import torchvision.utils as tvutils
-import torchtext as tt
-from math import log2
-from torchvision.utils import save_image
 from torch.utils.data import DataLoader
+from torchvision.transforms import v2
+from torchvision.datasets import CocoCaptions
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn as nn
+import torch.nn.functional as F
+import torchtext
+from torchtext.data.utils import get_tokenizer
+from tqdm import tqdm
 
-# torch.autograd.set_detect_anomaly(True)
+# Import the model definitions.
+from model import Text2ImgModel, DCGANDiscriminator
 
-SEQ_LENGTH = 32 # the number of tokens the system accepts
+# -----------------------------------------------------------------------------
+# Define data transforms using torchvision.transforms.v2.
+# -----------------------------------------------------------------------------
+transform = v2.Compose([
+    v2.Resize(256),
+    v2.RandomHorizontalFlip(),
+    v2.CenterCrop(256),
+    v2.ToTensor(),
+    v2.Normalize(mean=[0.485, 0.456, 0.406],
+                 std=[0.229, 0.224, 0.225])
+])
 
-LAMBDA_GP               = 10
-Z_DIM                   = 300
-W_DIM                   = 256
-IN_CHANNELS             = 256
-BATCH_SIZES             = [256, 128, 64, 32, 16, 8]
-PROGRESSIVE_EPOCHS      = [30] * len(BATCH_SIZES)
-START_TRAIN_AT_IMG_SIZE = 8 #The authors start from 8x8 images instead of 4x4
-CHANNELS_IMG            = 3
+# -----------------------------------------------------------------------------
+# Data Processing Utilities.
+# -----------------------------------------------------------------------------
+def process_caption(caption, tokenizer, embeddings, max_length=64):
+    """
+    Process a single caption: tokenize and convert each token to a vector using
+    pre-trained embeddings. Pads/truncates to max_length and generates a corresponding
+    padding mask (True for padded positions).
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.multiprocessing.set_sharing_strategy('file_system')
+    @param caption: Caption string.
+    @param tokenizer: Callable that tokenizes a string.
+    @param embeddings: Pre-trained embeddings (e.g., GloVe).
+    @param max_length: Maximum token sequence length.
+    @return: Tuple (tensor, mask) where tensor is shape (max_length, embedding_dim)
+             and mask is a boolean tensor of shape (max_length,) with True in padded positions.
+    """
+    tokens = tokenizer(caption.lower())
+    embedding_dim = embeddings.dim
+    tensor = torch.zeros(max_length, embedding_dim)
+    mask = torch.ones(max_length, dtype=torch.bool)  # True indicates a padded token.
+    for i in range(min(len(tokens), max_length)):
+        token = tokens[i]
+        if token in embeddings.stoi:
+            tensor[i] = embeddings.vectors[embeddings.stoi[token]]
+        else:
+            tensor[i] = torch.zeros(embedding_dim)
+        mask[i] = False  # Valid (non-padded) token.
+    return tensor, mask
 
-beta1disc = 0.5 # Beta1 hyperparam for Adam optimizers
-beta1gen = 0.5
-seed = time.time()
 
-lr = 1e-3
-
-current_epoch = 0
-current_step = -1
-
-# -= LOAD EMBEDDINGS =-
-
-embeddings = tt.vocab.GloVe(name="840B", dim=300)
-
-tokenizer = tt.data.get_tokenizer("basic_english")
-
-def vectorize_batch(batch):
-    Y, X = zip(*batch)#
-    img_size = len(Y[0][0])
-    X = [tokenizer(random.choice(x)) for x in X]
-    X = [tokens+[""] * (SEQ_LENGTH-len(tokens))  if len(tokens)<SEQ_LENGTH else tokens[:SEQ_LENGTH] for tokens in X]
-    X_tensor = torch.zeros(len(batch), SEQ_LENGTH, Z_DIM)
-    Y_tensor = torch.zeros(len(batch), 3, img_size, img_size)
-    for i, tokens in enumerate(X):
-        X_tensor[i] = embeddings.get_vecs_by_tokens(tokens)
-    for i, img in enumerate(Y):
-        Y_tensor[i] = img
+def collate_fn(batch, tokenizer, embeddings, max_length=64):
+    """
+    Custom collate function for the dataloader. Processes a batch and returns:
+     - images (tensor)
+     - text embeddings (tensor)
+     - padding masks (tensor)
     
-    return X_tensor, Y_tensor
+    @param batch: List of tuples (image, captions).
+    @param tokenizer: Text tokenizer.
+    @param embeddings: Pre-trained GloVe embeddings.
+    @param max_length: Maximum token sequence length.
+    @return: Tuple (batch_images, batch_text_embeddings, batch_masks)
+    """
+    images = []
+    text_embeddings = []
+    masks = []
+    for img, captions in batch:
+        images.append(img)
+        if captions:
+            emb, m = process_caption(captions[0], tokenizer, embeddings, max_length)
+        else:
+            emb = torch.zeros(max_length, embeddings.dim)
+            m = torch.ones(max_length, dtype=torch.bool)
+        text_embeddings.append(emb)
+        masks.append(m)
+    images = torch.stack(images)                 # (batch, channels, H, W)
+    text_embeddings = torch.stack(text_embeddings)  # (batch, max_length, embedding_dim)
+    masks = torch.stack(masks)                     # (batch, max_length)
+    return images, text_embeddings, masks
 
-def vectorize_text(text: str):
-    tokens = tokenizer(text)
-    tokens = tokens+[""] * (SEQ_LENGTH-len(tokens)) if len(tokens)<SEQ_LENGTH else tokens[:SEQ_LENGTH]
-    X_tensor = torch.zeros(1, SEQ_LENGTH, Z_DIM)
-    X_tensor[0] = embeddings.get_vecs_by_tokens(tokens)
-    return X_tensor
+# -----------------------------------------------------------------------------
+# Fixed text prompts for TensorBoard logging.
+# -----------------------------------------------------------------------------
+FIXED_PROMPTS = [
+    "a small dog in the park",
+    "a red sports car driving fast",
+    "a delicious plate of pasta on the table",
+    "a scenic mountain landscape during sunrise",
+    "a futuristic city skyline at night",
+    "a closeup of a blooming flower",
+    "a cat sitting on a window sill",
+    "a group of people dancing at a festival"
+]
 
-# -= DEFINE DATA LOADERS =-
+def generate_fixed_examples(model, tokenizer, embeddings, device):
+    """
+    Generate images for eight fixed text prompts for logging to TensorBoard.
+    
+    @param model: The Text2ImgModel.
+    @param tokenizer: Tokenizer for text.
+    @param embeddings: Pre-trained embeddings.
+    @param device: Torch device.
+    @return: Generated images tensor of shape (8, 3, 256, 256).
+    """
+    model.eval()
+    texts = []
+    masks = []
+    for prompt in FIXED_PROMPTS:
+        emb, m = process_caption(prompt, tokenizer, embeddings, max_length=64)
+        texts.append(emb)
+        masks.append(m)
+    text_embeddings = torch.stack(texts).to(device)  # (8, 64, embedding_dim)
+    masks = torch.stack(masks).to(device)              # (8, 64)
+    with torch.no_grad():
+        fake_imgs = model(text_embeddings, src_key_padding_mask=masks)
+    model.train()
+    return fake_imgs
 
-# transform = transforms.Compose([
-#     transforms.ToTensor(),
-#     transforms.Resize(IMG_SIZE, antialias=True),
-#     transforms.CenterCrop(IMG_SIZE),
-#     transforms.Normalize(0.5, 0.5)
-#     ])
+def weights_init_normal(m):
+    """
+    Initialize model weights with a normal distribution.
+    Applies to Conv2d, ConvTranspose2d, Linear, and BatchNorm2d layers.
+    
+    @param m: Module layer to initialize.
+    """
+    classname = m.__class__.__name__
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight.data, mean=0.0, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0)
+    elif isinstance(m, nn.Linear):
+        nn.init.normal_(m.weight.data, mean=0.0, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight.data, mean=1.0, std=0.02)
+        nn.init.constant_(m.bias.data, 0)
 
-# raw_data = datasets.CocoCaptions(root="data/train2017/", annFile="data/captions_train2017.json", transform=transform)
-# dataloader = DataLoader(raw_data, batch_size=64, shuffle=True, drop_last=True, num_workers=12, 
-#                         prefetch_factor=4, collate_fn=vectorize_batch) # tuple(zip(*batch))
 
-def get_loader(image_size):
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.CenterCrop(image_size),
-            transforms.Normalize(
-                [0.5 for _ in range(CHANNELS_IMG)],
-                [0.5 for _ in range(CHANNELS_IMG)],
-            ),
-        ]
-    )
-    batch_size = BATCH_SIZES[int(log2(image_size / 4))]
+# -----------------------------------------------------------------------------
+# Training function implementing adversarial training.
+# -----------------------------------------------------------------------------
+def train(args):
+    """
+    Train the text-to-image model with adversarial training.
+    Uses a generator (Text2ImgModel) and a discriminator (DCGANDiscriminator).
+    
+    @param args: Parsed command-line arguments.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Set up TensorBoard writer.
+    log_dir = os.path.join("runs", datetime.now().strftime("%Y%m%d-%H%M%S"))
+    writer = SummaryWriter(log_dir)
 
-    raw_data = datasets.CocoCaptions(
-        root="data/train2017/", 
-        annFile="data/captions_train2017.json", 
+    # Initialize dataset and dataloader.
+    dataset = CocoCaptions(
+        root="data/train2017/",
+        annFile="data/captions_train2017.json",
         transform=transform
     )
-
-    loader = DataLoader(
-        raw_data,
-        batch_size=batch_size,
+    tokenizer = get_tokenizer("basic_english")
+    embeddings = torchtext.vocab.GloVe(name="840B", dim=300)
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=vectorize_batch,
-        num_workers=12,
-        prefetch_factor=4,
+        collate_fn=lambda b: collate_fn(b, tokenizer, embeddings, max_length=64),
+        num_workers=20
     )
 
-    print("Loaded", len(raw_data), "training items")
+    # Instantiate models.
+    model = Text2ImgModel(
+        embedding_dim=300,
+        transformer_dim=512,
+        num_layers=4,
+        nhead=8,
+        dropout=0.1,
+        nc=3
+    ).to(device)
+    discriminator = DCGANDiscriminator(nc=3, ndf=64).to(device)
 
-    return loader, raw_data
-
-
-# -= DEFINE MODELS =-
-
-nlp_encoder = NLPLatentEncoder(Z_DIM)
-gen_net = StyleGenerator(Z_DIM, W_DIM, IN_CHANNELS, nlp_encoder)
-disc_net = Discriminator(IN_CHANNELS, nlp_encoder)
-
-gen_net.to(device)
-disc_net.to(device)
-
-# optimizer_gen = optim.Adam(gen_net.parameters(), lr=lr, betas=(beta1gen, 0.999))
-# optimizer_disc = optim.Adam(disc_net.parameters(), lr=lr, betas=(beta1disc, 0.999))
-
-optimizer_gen = optim.Adam([{"params": [param for name, param in gen_net.named_parameters() if "map" not in name]},
-                        {"params": gen_net.map.parameters(), "lr": 1e-5}], lr=lr, betas=(0.0, 0.99))
-optimizer_disc = optim.Adam(
-    disc_net.parameters(), lr=lr, betas=(0.0, 0.99)
-)
-
-criterion = nn.BCELoss().to(device)
-
-print(f"generator parameters: {count_parameters(gen_net):,}")
-print(f"discriminator parameters: {count_parameters(disc_net):,}")
-
-# test dictionary/tensorizor
-# print(text_to_tensor("green alien eating cake", dictionary, 100))
-# print(gen_net(["green alien eating cake"], device).shape)
-
-# -= DEFINE SAVE =-
-
-def save_checkpoint(step:int, seed:float):
-    torch.save({
-        "step": step,
-        "seed": seed,
-        "generator": {
-            "model_state": gen_net.state_dict(),
-            "optimizer_state": optimizer_gen.state_dict(),
-        },
-        "discriminator": {
-            "model_state": disc_net.state_dict(),
-            "optimizer_state": optimizer_disc.state_dict(),
-        },
-    }, f"checkpoints/checkpoint-{step:04d}.pt")
-
-# -= LOAD CHECKPOINT IF EXISTS =-
-
-loaded_checkpoint = False
-latest_cp = get_latest_checkpoint("checkpoints/")
-ckpt_path = f"checkpoints/{latest_cp}"
-if latest_cp:
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    current_step = checkpoint["step"]
-    seed = checkpoint["seed"]
-    # generator
-    gen_cp = checkpoint["generator"]
-    # discriminator
-    disc_cp = checkpoint["discriminator"]
-
-    loaded_checkpoint = True
-    print(f"Loading checkpoint file {latest_cp}\n")
-else:
-    print("No existing checkpoint found. Starting new training.\n")
-
-# Load checkpoints
-if loaded_checkpoint:
-    gen_net.load_state_dict(gen_cp["model_state"])
-    optimizer_gen.load_state_dict(gen_cp["optimizer_state"])
-    disc_net.load_state_dict(disc_cp["model_state"])
-    optimizer_disc.load_state_dict(disc_cp["optimizer_state"])
-    print("Loaded states")
-
-
-def generate_examples(gen: StyleGenerator, steps: int, n=100):
-    gen.eval()
-    alpha = 1.0
-    for i in range(n):
-        with torch.no_grad():
-            noise = torch.randn(1, 32, Z_DIM).to(device)
-            embeds = nlp_encoder(noise)
-            img = gen(embeds, alpha, steps)
-            if not os.path.exists(f'saved_examples/step{steps}'):
-                os.makedirs(f'saved_examples/step{steps}')
-            save_image(img*0.5+0.5, f"saved_examples/step{steps}/img_{i}.png")
-    gen.train()
-
-def generate_const_examples(gen: StyleGenerator, steps: int):
-    gen.eval()
-    gen.to(device)
-    alpha = 1.0
-    samples = [
-        "alien",
-        "A black Honda motorcycle parked in front of a garage",
-        "blue shirt",
-        "small, spotty elephant"
-        ]
+    # After instantiating your models, initialize their weights:
+    # For example, if 'model' is your generator and 'discriminator' is your DCGANDiscriminator:
+    model.apply(weights_init_normal)
+    discriminator.apply(weights_init_normal)
     
-    encoded = [nlp_encoder(vectorize_text(x).to(device)) for x in samples]
-
-    location = f"saved_examples/constant/step{steps}"
-
-    if not os.path.exists(location):
-        os.makedirs(location)
-
-    for z, text in zip(encoded, samples):
-        images = []
-        for _ in range(16):
-            img = gen(z, alpha, steps)
-            img = img.squeeze(0)
-            images.append(img*0.5+0.5)
-        save_image(images, f"{location}/{text}.png", nrow=4)
+    # Optimizers for generator and discriminator.
+    optimizer_G = optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=args.learning_rate, betas=(0.5, 0.999))
     
-    gen.train()
+    # Use BCEWithLogitsLoss.
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # Use one-sided label smoothing for real images.
+    real_label = 0.9
+    fake_label = 0.0
 
-generate_const_examples(gen_net,1)
+    global_step = 0
+    # Training loop.
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        discriminator.train()
+        running_loss_G = 0.0
+        running_loss_D = 0.0
+        
+        epoch_iterator = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
+        for batch_idx, (images, text_embeddings, masks) in enumerate(epoch_iterator):
+            batch_size_curr = images.size(0)
+            images = images.to(device)  # Real images (already 256x256 from the transforms).
+            text_embeddings = text_embeddings.to(device)
+            masks = masks.to(device)
+            real_imgs = images  # No resizing needed.
 
-# -= TRAIN =-
+            # Create labels.
+            real_labels = torch.full((batch_size_curr, 1), real_label, dtype=torch.float, device=device)
+            fake_labels = torch.full((batch_size_curr, 1), fake_label, dtype=torch.float, device=device)
+            
+            # -------------------------------------------------------
+            # 1) Update Discriminator: maximize log(D(x)) + log(1 - D(G(z))).
+            # -------------------------------------------------------
+            discriminator.zero_grad()
+            # Discriminator loss on real images.
+            output_real = discriminator(real_imgs)
+            loss_D_real = criterion(output_real, real_labels)
+            # Generate fake images.
+            fake_imgs = model(text_embeddings, src_key_padding_mask=masks)
+            output_fake = discriminator(fake_imgs.detach())
+            loss_D_fake = criterion(output_fake, fake_labels)
+            loss_D = loss_D_real + loss_D_fake
+            loss_D.backward()
+            optimizer_D.step()
+            
+            # -------------------------------------------------------
+            # 2) Update Generator: maximize log(D(G(z))).
+            # -------------------------------------------------------
+            model.zero_grad()
+            output_fake_for_G = discriminator(fake_imgs)
+            loss_G = criterion(output_fake_for_G, real_labels)
+            loss_G.backward()
+            optimizer_G.step()
+            
+            running_loss_D += loss_D.item()
+            running_loss_G += loss_G.item()
+            avg_loss_D = running_loss_D / (batch_idx + 1)
+            avg_loss_G = running_loss_G / (batch_idx + 1)
+            
+            epoch_iterator.set_postfix(loss_D=avg_loss_D, loss_G=avg_loss_G)
+            writer.add_scalar("Loss/Discriminator", loss_D.item(), global_step)
+            writer.add_scalar("Loss/Generator", loss_G.item(), global_step)
 
-# gradient_penalty function for WGAN-GP loss
-def gradient_penalty(critic: Discriminator, real, fake, alpha: float, train_step: int, embeds, device="cpu"):
-    BATCH_SIZE, C, H, W = real.shape
-    beta = torch.rand((BATCH_SIZE, 1, 1, 1)).repeat(1, C, H, W).to(device)
-    interpolated_images = real * beta + fake.detach() * (1 - beta)
-    interpolated_images.requires_grad_(True)
+            # Every 500 batches log eight example images (from fixed text prompts) to TensorBoard.
+            if global_step % 250 == 0:
+                fake_examples = generate_fixed_examples(model, tokenizer, embeddings, device)
+                # fake_examples shape: (8, 3, 256, 256), scale to [0,1] from [-1,1]
+                fake_examples = (fake_examples + 1) / 2.0
+                writer.add_images(tag="FixedExamples", img_tensor=fake_examples, global_step=global_step)
 
-    # Calculate critic scores
-    mixed_scores = critic(interpolated_images, embeds, alpha, train_step)
- 
-    # Take the gradient of the scores with respect to the images
-    gradient = torch.autograd.grad(
-        inputs=interpolated_images,
-        outputs=mixed_scores,
-        grad_outputs=torch.ones_like(mixed_scores),
-        create_graph=True,
-        retain_graph=True,
-    )[0]
-    gradient = gradient.view(gradient.shape[0], -1)
-    gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean((gradient_norm - 1) ** 2)
-    return gradient_penalty
+            global_step += 1
+    
+        # Save checkpoints after each epoch.
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        model_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch}.pth")
+        disc_path = os.path.join(args.checkpoint_dir, f"discriminator_epoch_{epoch}.pth")
+        torch.save(model.state_dict(), model_path)
+        torch.save(discriminator.state_dict(), disc_path)
+        print(f"Epoch {epoch}: Generator checkpoint saved to {model_path}")
+        print(f"Epoch {epoch}: Discriminator checkpoint saved to {disc_path}")
 
-def train_fn(critic: Discriminator, gen: StyleGenerator, loader, dataset, step, alpha, opt_critic, opt_gen):
-    loop = tqdm(loader, leave=True)
-
-    for batch_idx, (texts, imgs) in enumerate(loop):
-        texts = texts.to(device)
-        imgs = imgs.to(device)
-        cur_batch_size = imgs.shape[0]
-
-        # TODO: Fix training to use images
-        embeds = nlp_encoder(texts)
-
-        #noise = torch.randn(cur_batch_size, Z_DIM).to(device)
-
-        fake = gen(embeds, alpha, step)
-        critic_real = critic(imgs, embeds, alpha, step)
-        critic_fake = critic(fake.detach(), embeds, alpha, step)
-        gp = gradient_penalty(critic, imgs, fake, alpha, step, embeds, device=device)
-        loss_critic = (
-            -(torch.mean(critic_real) - torch.mean(critic_fake))
-            + LAMBDA_GP * gp
-            + (0.001 * torch.mean(critic_real ** 2))
-        )
-
-        critic.zero_grad()
-        loss_critic.backward(retain_graph=True)
-        opt_critic.step()
-
-        gen_fake = critic(fake, embeds, alpha, step)
-        loss_gen = -torch.mean(gen_fake)
-
-        gen.zero_grad()
-        loss_gen.backward()
-        opt_gen.step()
-
-        # Update alpha and ensure less than 1
-        alpha += cur_batch_size / (
-            (PROGRESSIVE_EPOCHS[step] * 0.5) * len(dataset)
-        )
-        alpha = min(alpha, 1)
-
-        loop.set_postfix(
-            gp=gp.item(),
-            loss_critic=loss_critic.item(),
-        )
-
-
-    return alpha
+    writer.close()
 
 
-gen_net.train()
-disc_net.train()
+def parse_args():
+    """
+    Parse command-line arguments.
+    
+    @return: Parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description="Train text-to-image model using transformer encoder and DCGAN at 256x256 resolution.")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size.")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate for optimizer.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save model checkpoints.")
+    return parser.parse_args()
 
-torch.manual_seed(seed)
 
-# start at step that corresponds to img size that we set in config
-step = int(log2(START_TRAIN_AT_IMG_SIZE / 4)) if current_step < 0 else current_step
-for num_epochs in PROGRESSIVE_EPOCHS[step:]:
-    alpha = 1e-5   # start with very low alpha
-    loader, dataset = get_loader(4 * 2 ** step)
-
-    print(f"Current image size: {4 * 2 ** step}")
-
-    for epoch in range(num_epochs):
-        print(f"Epoch [{epoch+1}/{num_epochs}]")
-        alpha = train_fn(
-            disc_net,
-            gen_net,
-            loader,
-            dataset,
-            step,
-            alpha,
-            optimizer_disc,
-            optimizer_gen
-        )
-        generate_const_examples(gen_net, step)
-
-    save_checkpoint(step, seed)
-    generate_examples(gen_net, step)
-    step += 1  # progress to the next img size
-
+if __name__ == "__main__":
+    args = parse_args()
+    train(args)
